@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Datasets & large files
+datasets/
+pretrained/
+exported/
+compressed/
+
+# Training artifacts
+experiments/
+tb_logger/
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# LaTeX
+docs/*.aux
+docs/*.bbl
+docs/*.blg
+docs/*.log
+docs/*.out
+docs/*.fls
+docs/*.fdb_latexmk
+docs/*.synctex.gz
+docs/*.pdf
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
