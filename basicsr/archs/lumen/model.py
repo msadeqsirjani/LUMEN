@@ -1,53 +1,61 @@
 """
-LUMEN: Ultra-Lightweight Super-Resolution for STM32 Cortex-M.
+LUMEN: Lightweight Multi-Scale Network for Efficient Super-Resolution.
 
 Architecture:
-    Input → Conv3x3 [shallow] → N × LumenGroup → Conv3x3 [deep]
-          → + global skip → Upsample → Output
+    Input (LR) → Conv3x3 → N × LumenBlock → Conv3x3 + skip → Upsample → Output (HR)
 
-Default config: embed_dim=32, depths=(4,4), expand_ratio=2.5 → ~141K params
+Each LumenBlock: RepDCCM → EPMSDM → PFA → Conv1x1 + residual
+
+Configs:
+    LUMEN:      embed_dim=48, num_blocks=16, partial_ch=12, large_kernel=21
+    LUMEN-tiny: embed_dim=32, num_blocks=8,  partial_ch=8,  large_kernel=17
 """
 
-import math
 import torch
 import torch.nn as nn
 
-from .blocks import LumenGroup
+from .lumen_block import LumenBlock
 
 
 def _init_weights(m: nn.Module):
     """Initialize weights for stable training."""
-    if isinstance(m, (nn.Conv2d, nn.Linear)):
+    if isinstance(m, nn.Conv2d):
         nn.init.trunc_normal_(m.weight, std=0.02)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-    elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
-        nn.init.ones_(m.weight)
-        nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=0.02)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
 
 
 class LUMEN(nn.Module):
-    """LUMEN: Ultra-Lightweight Super-Resolution Network.
+    """LUMEN: Lightweight Multi-Scale Network for Efficient Super-Resolution.
 
-    Designed for deployment on STM32 Cortex-M MCUs via TFLite Micro.
-    All operations are INT8-quantization friendly and CMSIS-NN compatible.
-
-    Architecture:
-        Input (LR) → shallow conv → N×LumenGroup → deep conv
-                   → + global skip → PixelShuffle → Output (HR)
+    GPU-efficient architecture combining:
+      - RepDCCM: re-parameterizable channel mixer (train multi-branch, infer single conv)
+      - EPMSDM: three-scale partial depthwise spatial mixer (fine/medium/global)
+      - PFA: parameter-free attention (zero extra params)
+      - StarReLU: efficient activation (4 FLOPs vs GELU's 14)
 
     Args:
-        num_in_ch: Number of input image channels (3 for RGB, 1 for gray).
+        num_in_ch: Number of input image channels (3 for RGB).
         num_out_ch: Number of output image channels.
-        embed_dim: Feature channel dimension throughout the network.
-        depths: Tuple of ints, number of LumenBlocks per group.
-        expand_ratio: FFN expansion ratio (hidden = dim * expand_ratio).
-        upscale: Super-resolution scale factor (2 or 4).
+        embed_dim: Feature channel dimension.
+        num_blocks: Total number of LumenBlocks.
+        partial_ch: Channels per active branch in spatial mixer.
+        large_kernel: Size of decomposed large kernel.
+        upscale: Super-resolution scale factor (2, 3, or 4).
         img_range: Image value range for normalization (1.0 for [0,1]).
         upsampler: Upsampling mode:
-            'pixelshuffledirect' - lightweight single PixelShuffle (default)
+            'pixelshuffledirect' - single PixelShuffle (default, lightweight)
             'pixelshuffle' - progressive PixelShuffle for larger scales
             '' - no upsampling (for denoising / artifact removal)
+        use_reparam: Use RepDCCM (True) or plain DCCM (False).
+        spatial_mixer: 'epmsdm' (3-scale) or 'pmsdm' (2-scale original).
+        attention: 'pfa' (parameter-free) or 'none'.
+        activation: 'star_relu' or 'gelu'.
+        deploy: If True, initialize with fused re-param convolutions.
     """
 
     def __init__(
@@ -55,11 +63,17 @@ class LUMEN(nn.Module):
         num_in_ch: int = 3,
         num_out_ch: int = 3,
         embed_dim: int = 32,
-        depths: tuple = (4, 4),
-        expand_ratio: float = 2.5,
+        num_blocks: int = 8,
+        partial_ch: int = 8,
+        large_kernel: int = 17,
         upscale: int = 4,
         img_range: float = 1.0,
         upsampler: str = 'pixelshuffledirect',
+        use_reparam: bool = True,
+        spatial_mixer: str = 'epmsdm',
+        attention: str = 'pfa',
+        activation: str = 'star_relu',
+        deploy: bool = False,
     ):
         super().__init__()
         self.img_range = img_range
@@ -76,10 +90,17 @@ class LUMEN(nn.Module):
         # Shallow feature extraction
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
 
-        # Deep feature extraction: N × LumenGroup
-        self.groups = nn.ModuleList([
-            LumenGroup(embed_dim, depths[i], expand_ratio)
-            for i in range(len(depths))
+        # Deep feature extraction: N × LumenBlock (flat, no groups)
+        self.blocks = nn.Sequential(*[
+            LumenBlock(
+                embed_dim, partial_ch, large_kernel,
+                use_reparam=use_reparam,
+                spatial_mixer=spatial_mixer,
+                attention=attention,
+                activation=activation,
+                deploy=deploy,
+            )
+            for _ in range(num_blocks)
         ])
 
         # Deep feature aggregation
@@ -87,66 +108,38 @@ class LUMEN(nn.Module):
 
         # Upsampler / reconstruction head
         if upsampler == 'pixelshuffledirect':
-            # Lightweight: single PixelShuffle (best for MCU, minimal memory)
             self.upsample = nn.Sequential(
                 nn.Conv2d(embed_dim, num_out_ch * (upscale ** 2), 3, 1, 1),
                 nn.PixelShuffle(upscale),
             )
-        elif upsampler == 'pixelshuffle':
-            # Progressive PixelShuffle for power-of-2 scales
-            self.conv_before_upsample = nn.Sequential(
-                nn.Conv2d(embed_dim, embed_dim, 3, 1, 1),
-                nn.ReLU6(inplace=True),
-            )
-            upsample_layers = []
-            for _ in range(int(math.log2(upscale))):
-                upsample_layers += [
-                    nn.Conv2d(embed_dim, 4 * embed_dim, 3, 1, 1),
-                    nn.PixelShuffle(2),
-                    nn.ReLU6(inplace=True),
-                ]
-            self.upsample = nn.Sequential(*upsample_layers)
-            self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
         elif upsampler == '':
-            # No upsampling: for denoising / JPEG artifact removal
             self.conv_last = nn.Conv2d(embed_dim, num_out_ch, 3, 1, 1)
 
         self.apply(_init_weights)
-
-    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        for group in self.groups:
-            x = group(x)
-        return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Normalize
         x = (x - self.mean) * self.img_range
 
+        # Feature extraction with global skip
+        feat = self.conv_first(x)
+        body = self.conv_after_body(self.blocks(feat)) + feat
+
+        # Reconstruction
         if self.upsampler == 'pixelshuffledirect':
-            feat = self.conv_first(x)
-            body = self.forward_features(feat)
-            body = self.conv_after_body(body) + feat
             x = self.upsample(body)
-
-        elif self.upsampler == 'pixelshuffle':
-            feat = self.conv_first(x)
-            body = self.forward_features(feat)
-            body = self.conv_after_body(body) + feat
-            body = self.conv_before_upsample(body)
-            x = self.conv_last(self.upsample(body))
-
         elif self.upsampler == '':
-            feat = self.conv_first(x)
-            body = self.forward_features(feat)
-            body = self.conv_after_body(body) + feat
             x = self.conv_last(body)
 
         # De-normalize
         x = x / self.img_range + self.mean
         return x
 
+    def fuse(self):
+        """Collapse all re-param branches for inference deployment."""
+        for block in self.blocks:
+            block.fuse()
+
     @property
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-

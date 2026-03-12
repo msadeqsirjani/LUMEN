@@ -1,22 +1,18 @@
-name: LUMEN_x3_DIV2K
+name: ablation_kernel_K21
 model_type: SRModel
-scale: 3
+scale: 2
 num_gpu: 1
 manual_seed: 42
 
 datasets:
   train:
-    name: DIV2K_Flickr2K
+    name: DIV2K
     type: PairedImageDataset
-    dataroot_gt:
-      - datasets/DIV2K/HR/Train
-      - datasets/Flickr2K/HR
-    dataroot_lq:
-      - datasets/DIV2K/LR_bicubic/Train/X3
-      - datasets/Flickr2K/LR_bicubic/X3
+    dataroot_gt: datasets/DIV2K/HR/Train
+    dataroot_lq: datasets/DIV2K/LR_bicubic/Train/X2
     io_backend:
       type: disk
-    gt_size: 192
+    gt_size: 128
     use_hflip: true
     use_rot: true
     dataset_enlarge_ratio: 1
@@ -28,22 +24,23 @@ datasets:
     name: Set5
     type: PairedImageDataset
     dataroot_gt: datasets/Benchmarks/Set5/HR
-    dataroot_lq: datasets/Benchmarks/Set5/LR_bicubic/X3
+    dataroot_lq: datasets/Benchmarks/Set5/LR_bicubic/X2
     io_backend:
       type: disk
 
+# Kernel size ablation: K=21
 network_g:
   type: LUMEN
   embed_dim: 32
   num_blocks: 8
-  large_kernel: 17
+  large_kernel: 21
   partial_ch: 8
-  upscale: 3
+  upscale: 2
   upsampler: pixelshuffledirect
   img_range: 1.0
 
 path:
-  experiments_root: experiments
+  experiments_root: experiments/ablation
   pretrain_network_g: ~
   strict_load_g: true
   resume_state: ~
@@ -79,11 +76,11 @@ val:
   metrics:
     psnr:
       type: calculate_psnr
-      crop_border: 3
+      crop_border: 2
       test_y_channel: true
     ssim:
       type: calculate_ssim
-      crop_border: 3
+      crop_border: 2
       test_y_channel: true
 
 logger:

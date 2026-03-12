@@ -44,8 +44,9 @@ datasets:
 network_g:
   type: LUMEN
   embed_dim: 32
-  depths: [4, 4]
-  expand_ratio: 2.5
+  num_blocks: 8
+  large_kernel: 17
+  partial_ch: 8
   upscale: 3
   upsampler: pixelshuffledirect
   img_range: 1.0
